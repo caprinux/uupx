@@ -148,6 +148,97 @@ static void alloc_file_image(MemBuffer &mb, off_t size)
     }
 }
 
+// Check if the ELF entry point contains a known UPX decompression stub.
+// Returns true if a recognized stub signature is found.
+// This is used by --force-unpack to confirm the binary is genuinely UPX-packed
+// before attempting decompression, even when all other metadata is clobbered.
+static bool checkUPXStub(InputFile *fi, const void *ehdr_raw, int ei_class)
+{
+    unsigned char entry_buf[32];
+    memset(entry_buf, 0, sizeof(entry_buf));
+
+    upx_uint64_t e_entry;
+    unsigned e_phnum;
+    if (ei_class == 2) { // ELF64
+        auto const *ehdr = (const Elf64_Ehdr *)ehdr_raw;
+        e_entry = get_le64(&ehdr->e_entry);
+        e_phnum = get_le16(&ehdr->e_phnum);
+        // Find file offset of entry point via program headers
+        for (unsigned i = 0; i < e_phnum && i < 16; ++i) {
+            Elf64_Phdr phdr;
+            fi->seek(sizeof(Elf64_Ehdr) + i * sizeof(Elf64_Phdr), SEEK_SET);
+            fi->readx(&phdr, sizeof(phdr));
+            if (get_le32(&phdr.p_type) == PT_LOAD) {
+                upx_uint64_t vaddr  = get_le64(&phdr.p_vaddr);
+                upx_uint64_t filesz = get_le64(&phdr.p_filesz);
+                upx_uint64_t offset = get_le64(&phdr.p_offset);
+                if (vaddr <= e_entry && e_entry < vaddr + filesz) {
+                    fi->seek(e_entry - vaddr + offset, SEEK_SET);
+                    fi->readx(entry_buf, sizeof(entry_buf));
+                    break;
+                }
+            }
+        }
+    } else { // ELF32
+        auto const *ehdr = (const Elf32_Ehdr *)ehdr_raw;
+        e_entry = get_le32(&ehdr->e_entry);
+        e_phnum = get_le16(&ehdr->e_phnum);
+        for (unsigned i = 0; i < e_phnum && i < 16; ++i) {
+            Elf32_Phdr phdr;
+            fi->seek(sizeof(Elf32_Ehdr) + i * sizeof(Elf32_Phdr), SEEK_SET);
+            fi->readx(&phdr, sizeof(phdr));
+            if (get_le32(&phdr.p_type) == PT_LOAD) {
+                unsigned vaddr  = get_le32(&phdr.p_vaddr);
+                unsigned filesz = get_le32(&phdr.p_filesz);
+                unsigned offset = get_le32(&phdr.p_offset);
+                if (vaddr <= e_entry && e_entry < vaddr + filesz) {
+                    fi->seek(e_entry - vaddr + offset, SEEK_SET);
+                    fi->readx(entry_buf, sizeof(entry_buf));
+                    break;
+                }
+            }
+        }
+    }
+
+    const unsigned char *p = entry_buf;
+
+    // Skip optional endbr64 (f3 0f 1e fa) or endbr32 (f3 0f 1e fb)
+    if (p[0] == 0xf3 && p[1] == 0x0f && p[2] == 0x1e && (p[3] == 0xfa || p[3] == 0xfb))
+        p += 4;
+
+    if (ei_class == 2) {
+        // amd64 UPX stub: pop rcx; push rsp; pop rdi; push rcx; push rdx
+        // = 59 54 5f 51 52
+        // Followed by lea r15,[rip+X]; xor eax,eax; scas; jne; scas; jne
+        // The scas/jne auxv scan pattern (31 c0 48 af 75 fc 48 af 75 fc)
+        // is unique to UPX.
+        if (p[0] == 0x59 && p[1] == 0x54 && p[2] == 0x5f
+        &&  p[3] == 0x51 && p[4] == 0x52)
+            return true;
+    } else {
+        // i386 UPX stub: call <offset> (e8 xx xx xx xx) followed by the NRV
+        // bit-reader helper laid out immediately after within the stub:
+        //   add ebx,ebx; je +2; repz ret; mov ebx,[esi]; sub esi,-4; adc ebx,ebx
+        //   = 01 db 74 02 f3 c3 8b 1e 83 ee fc 11 db
+        // The NRV helper appears within the first ~32 bytes of the stub, right
+        // after the call instruction (possibly preceded by another endbr32).
+        if (p[0] == 0xe8) {
+            static const unsigned char nrv_sig[] = {
+                0x01, 0xdb, 0x74, 0x02, 0xf3, 0xc3,
+                0x8b, 0x1e, 0x83, 0xee, 0xfc, 0x11, 0xdb
+            };
+            // Search within the entry buffer after the call instruction
+            const unsigned char *end_buf = entry_buf + sizeof(entry_buf);
+            for (const unsigned char *q = p + 5; q + sizeof(nrv_sig) <= end_buf; ++q) {
+                if (0 == memcmp(q, nrv_sig, sizeof(nrv_sig)))
+                    return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 int
 PackLinuxElf32::checkEhdr(Elf32_Ehdr const *ehdr) const
 {
@@ -2810,7 +2901,10 @@ tribool PackLinuxElf32::canUnpack() // bool, except -1: format known, but not pa
         return true;
     }
     if (opt->force_unpack) {
-        // --force-unpack: read overlay_offset and PackHeader from end of file
+        // --force-unpack: verify the entry point contains a known UPX stub
+        if (!checkUPXStub(fi, &ehdri, Elf32_Ehdr::ELFCLASS32))
+            return false;  // not a UPX-packed binary
+        // read overlay_offset and PackHeader from end of file
         unsigned const e_phnum_local = get_te16(&ehdri.e_phnum);
         sz_elf_hdrs = sizeof(Elf32_Ehdr) + e_phnum_local * sizeof(Elf32_Phdr);
         int const my_format = getFormat();  // this packer's expected format
@@ -3585,7 +3679,10 @@ tribool PackLinuxElf64::canUnpack() // bool, except -1: format known, but not pa
         return true;
     }
     if (opt->force_unpack) {
-        // --force-unpack: UPX! magic and other metadata may be clobbered.
+        // --force-unpack: verify the entry point contains a known UPX stub
+        if (!checkUPXStub(fi, &ehdri, Elf64_Ehdr::ELFCLASS64))
+            return false;  // not a UPX-packed binary
+        // UPX! magic and other metadata may be clobbered.
         // Strategy: try reading PackHeader from end of file first.
         // If that looks invalid, scan for valid b_info chain to find overlay_offset.
         unsigned const e_phnum_local = get_te16(&ehdri.e_phnum);
