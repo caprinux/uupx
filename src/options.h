@@ -80,6 +80,7 @@ struct Options final {
     int backup;
     int console;
     int force;
+    bool force_unpack;    // skip metadata validation during unpack (for tampered headers)
     bool force_overwrite;
     int info_mode;
     bool ignorewarn;

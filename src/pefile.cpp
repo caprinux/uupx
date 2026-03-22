@@ -2996,7 +2996,7 @@ void PeFile::unpack0(OutputFile *fo, const ht &ih, ht &oh, ord_mask_t ord_mask, 
     // objs);
 
     handleStub(fi, fo, pe_offset);
-    if (ih.filealign == 0)
+    if (ih.filealign == 0 && !opt->force_unpack)
         throwCantUnpack("unexpected value in the PE header");
 
     const unsigned iobjs = ih.objects;
@@ -3131,8 +3131,21 @@ int PeFile::canUnpack0(unsigned max_sections, unsigned objs, unsigned ih_entry, 
             found_ph = readPackHeader(1024);
         }
     }
+    if (!found_ph && opt->force_unpack) {
+        // --force-unpack: section names may be clobbered; try common locations anyway
+        if (objs >= min_sections) {
+            fi->seek(isection[1].rawdataptr - 64, SEEK_SET);
+            found_ph = readPackHeader(1024);
+            if (!found_ph && objs > 2) {
+                fi->seek(isection[2].rawdataptr, SEEK_SET);
+                found_ph = readPackHeader(1024);
+            }
+        }
+    }
     if (is_packed && found_ph)
         return true;
+    if (opt->force_unpack && found_ph)
+        return true;  // --force-unpack: trust the PackHeader even if heuristics say "not packed"
     if (!is_packed && !found_ph)
         return -1;
     if (is_packed && ih_entry < isection[2].vaddr) {
@@ -3154,6 +3167,8 @@ int PeFile::canUnpack0(unsigned max_sections, unsigned objs, unsigned ih_entry, 
         } catch (...) {
             // x = true;
         }
+        if (opt->force_unpack)
+            return false;  // --force-unpack: don't throw, just report not found
         if (x)
             throwCantUnpack("file is modified/hacked/protected; take care!!!");
         else

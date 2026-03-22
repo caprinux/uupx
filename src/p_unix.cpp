@@ -482,19 +482,40 @@ unsigned PackUnix::unpackExtent(unsigned wanted, OutputFile *fo,
     b_info hdr; memset(&hdr, 0, sizeof(hdr));
     unsigned inlen = 0; // output index (if-and-only-if peeking)
     while (wanted) {
-        fi->readx(&hdr, szb_info);
+        if (opt->force_unpack) {
+            // Check if we can read a b_info header without going past EOF
+            int n = fi->read(&hdr, szb_info);
+            if (n != (int)szb_info)
+                break;  // EOF reached, stop
+        } else {
+            fi->readx(&hdr, szb_info);
+        }
         int const sz_unc = ph.u_len = get_te32(&hdr.sz_unc);
         int const sz_cpr = ph.c_len = get_te32(&hdr.sz_cpr);
         ph.filter_cto = hdr.b_cto8;
 
-        if (sz_unc == 0 || M_LZMA < hdr.b_method) {
+        if (sz_unc == 0 || (!opt->force_unpack && M_LZMA < hdr.b_method)) {
+            if (opt->force_unpack)
+                break;  // treat as end-of-data
             throwCantUnpack("corrupt b_info");
             break;
         }
-        if (sz_unc <= 0 || sz_cpr <= 0)
+        if (sz_unc <= 0 || sz_cpr <= 0) {
+            if (opt->force_unpack)
+                break;  // treat as end-of-data
             throwCantUnpack("corrupt b_info");
-        if (sz_cpr > sz_unc || sz_unc > (int)blocksize)
+        }
+        if (sz_cpr > sz_unc || sz_unc > (int)blocksize) {
+            if (opt->force_unpack)
+                break;  // treat as end-of-data
             throwCantUnpack("corrupt b_info");
+        }
+        if (opt->force_unpack) {
+            upx_off_t remaining = file_size - fi->tell();
+            if (remaining < 0 || (unsigned)sz_cpr > (unsigned)remaining) {
+                break;  // sz_cpr would read past EOF
+            }
+        }
 
         // place the input for overlapping de-compression
         int j = inlen + sz_unc + OVERHEAD - sz_cpr;
@@ -590,11 +611,15 @@ int PackUnix::find_overlay_offset(MemBuffer const &buf)
         return false;
 
     int l = ph.buf_offset + ph.getPackHeaderSize();
-    if (l < 0 || i + l + 4 > bufsize)
+    if (l < 0 || i + l + 4 > bufsize) {
+        if (opt->force_unpack) return false;
         throwCantUnpack("file corrupted");
+    }
     overlay_offset = get_te32(buf + i + l);
-    if ((off_t)overlay_offset >= file_size)
+    if ((off_t)overlay_offset >= file_size) {
+        if (opt->force_unpack) return false;
         throwCantUnpack("file corrupted");
+    }
 
     return true;
 }
@@ -632,7 +657,15 @@ void PackUnix::unpack(OutputFile *fo)
         ||  max_inflated < blocksize
         ||  file_size > (off_t)orig_file_size
         ||  blocksize > orig_file_size) {
-            throwCantUnpack("file header corrupted");
+            if (!opt->force_unpack)
+                throwCantUnpack("file header corrupted");
+            // --force-unpack: use sane defaults if p_info is clobbered
+            if (orig_file_size == 0 || blocksize == 0) {
+                if (blocksize == 0)
+                    blocksize = 512 * 1024;
+                if (orig_file_size == 0)
+                    orig_file_size = ph.u_file_size ? ph.u_file_size : file_size * 8;
+            }
         }
     }
     else
@@ -668,7 +701,7 @@ void PackUnix::unpack(OutputFile *fo)
         {
             // note: must reload sz_cpr as magic is always stored le32
             sz_cpr = get_le32(&bhdr.sz_cpr);
-            if (sz_cpr != UPX_MAGIC_LE32)  // sz_cpr must be h->magic
+            if (sz_cpr != UPX_MAGIC_LE32 && !opt->force_unpack)  // sz_cpr must be h->magic
                 throwCompressedDataViolation();
             break;
         }
@@ -677,9 +710,11 @@ void PackUnix::unpack(OutputFile *fo)
         // (32 bit look-back offset of all 1s: encoded as 24 pairs of bits
         // {not last, 1} then low 8-bits of 0xff; total: 8 + 2*24 + 8 bits
         // ==> 8 bytes)
-        if (sz_unc <= 0 || sz_cpr <= 5u
-        ||  sz_cpr > sz_unc || sz_unc > blocksize)
-            throwCantUnpack("corrupt b_info %#x %#x", sz_unc, sz_cpr);
+        if (!opt->force_unpack) {
+            if (sz_unc <= 0 || sz_cpr <= 5u
+            ||  sz_cpr > sz_unc || sz_unc > blocksize)
+                throwCantUnpack("corrupt b_info %#x %#x", sz_unc, sz_cpr);
+        }
 
         // Compressed output has control bytes such as the 32-bit
         // first flag bits of NRV_d32, the 5-byte info of LZMA, etc.
@@ -717,11 +752,11 @@ void PackUnix::unpack(OutputFile *fo)
     ph.u_len = total_out;
 
     // all bytes must be written
-    if (ph.version > 8 && total_out != orig_file_size)
+    if (ph.version > 8 && total_out != orig_file_size && !opt->force_unpack)
         throwEOFException();
 
     // finally test the checksums
-    if (ph.c_adler != c_adler || ph.u_adler != u_adler)
+    if ((ph.c_adler != c_adler || ph.u_adler != u_adler) && !opt->force_unpack)
         throwChecksumError();
 }
 

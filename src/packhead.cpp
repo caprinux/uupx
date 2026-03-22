@@ -50,8 +50,10 @@ int PackHeader::set_method(int m, unsigned offset) {
     unsigned lo = 0xFF & m;
     // See packer_c.cpp for "hi bytes" in M_LZMA_003 and M_LZMA_407.
     // "hi bytes" are not allowed unless M_LZMA.
-    if ((lo < M_NRV2B_LE32 || M_LZMA < lo || (M_LZMA != lo && mc != lo)) && ~0u != offset)
-        throwCantPack("bad method %#x at %#x", (unsigned) m, offset);
+    if ((lo < M_NRV2B_LE32 || M_LZMA < lo || (M_LZMA != lo && mc != lo)) && ~0u != offset) {
+        if (!opt->force_unpack)
+            throwCantPack("bad method %#x at %#x", (unsigned) m, offset);
+    }
     return method = m;
 }
 
@@ -188,8 +190,11 @@ void PackHeader::putPackHeader(SPAN_S(byte) p) const {
 
 bool PackHeader::decodePackHeaderFromBuf(SPAN_S(const byte) buf, int blen) {
     int boff = find_le32(raw_bytes(buf, blen), blen, UPX_MAGIC_LE32);
-    if (boff < 0)
+    if (boff < 0) {
+        // UPX! magic not found. With --force-unpack, format-specific
+        // canUnpack() will handle finding the data via structure analysis.
         return false;
+    }
     blen -= boff; // bytes remaining in buf
     if (blen < 20)
         throwCantUnpack("header corrupted 1");
@@ -208,7 +213,8 @@ bool PackHeader::decodePackHeaderFromBuf(SPAN_S(const byte) buf, int blen) {
     }
     if (!((format >= 1 && format <= UPX_F_LINUX_ELF64_RISCV64) ||
           (format >= 129 && format <= UPX_F_DYLIB_PPC64))) {
-        throwCantUnpack("unknown format %d", format);
+        if (!opt->force_unpack)
+            throwCantUnpack("unknown format %d", format);
     }
 
     //
@@ -274,16 +280,18 @@ bool PackHeader::decodePackHeaderFromBuf(SPAN_S(const byte) buf, int blen) {
     // now some checks
     //
 
-    if (version == 0xff)
+    if (version == 0xff && !opt->force_unpack)
         throwCantUnpack("cannot unpack UPX ;-)");
     // check header_checksum
-    if (version >= 10) {
+    if (version >= 10 && !opt->force_unpack) {
         int size = getPackHeaderSize(); // expected; based on format and version
         if (size > blen || p[size - 1] != get_packheader_checksum(p, size - 1))
             throwCantUnpack("header corrupted 3");
     }
-    if (c_len < 2 || u_len < 2 || !mem_size_valid_bytes(c_len) || !mem_size_valid_bytes(u_len))
-        throwCantUnpack("header corrupted 4");
+    if (!opt->force_unpack) {
+        if (c_len < 2 || u_len < 2 || !mem_size_valid_bytes(c_len) || !mem_size_valid_bytes(u_len))
+            throwCantUnpack("header corrupted 4");
+    }
 
     //
     // success
@@ -332,14 +340,14 @@ bool ph_skipVerify(const PackHeader &ph) noexcept {
 void ph_decompress(PackHeader &ph, SPAN_P(const byte) in, SPAN_P(byte) out, bool verify_checksum,
                    Filter *ft) {
     // verify checksum of compressed data
-    if (verify_checksum) {
+    if (verify_checksum && !opt->force_unpack) {
         unsigned adler = upx_adler32(raw_bytes(in, ph.c_len), ph.c_len, ph.saved_c_adler);
         if (adler != ph.c_adler)
             throwChecksumError();
     }
 
     // decompress
-    if (ph.u_len < ph.c_len)
+    if (ph.u_len < ph.c_len && !opt->force_unpack)
         throwCantUnpack("header corrupted");
     unsigned new_len = ph.u_len;
     int r = upx_decompress(raw_bytes(in, ph.c_len), ph.c_len, raw_bytes(out, ph.u_len), &new_len,
@@ -350,7 +358,7 @@ void ph_decompress(PackHeader &ph, SPAN_P(const byte) in, SPAN_P(byte) out, bool
         throwCompressedDataViolation();
 
     // verify checksum of decompressed data
-    if (verify_checksum) {
+    if (verify_checksum && !opt->force_unpack) {
         if (ft)
             ft->unfilter(out, ph.u_len);
         unsigned adler = upx_adler32(raw_bytes(out, ph.u_len), ph.u_len, ph.saved_u_adler);

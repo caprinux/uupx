@@ -2809,6 +2809,78 @@ tribool PackLinuxElf32::canUnpack() // bool, except -1: format known, but not pa
     if (super::canUnpack()) {
         return true;
     }
+    if (opt->force_unpack) {
+        // --force-unpack: read overlay_offset and PackHeader from end of file
+        unsigned const e_phnum_local = get_te16(&ehdri.e_phnum);
+        sz_elf_hdrs = sizeof(Elf32_Ehdr) + e_phnum_local * sizeof(Elf32_Phdr);
+        int const my_format = getFormat();  // this packer's expected format
+
+        bool found = false;
+        // Try 1: Read overlay_offset and PackHeader from end of file
+        int const ph_size = 32;
+        int const trailer_size = ph_size + 4;
+        MemBuffer trailer_buf(trailer_size);
+        fi->seek(file_size - trailer_size, SEEK_SET);
+        fi->readx(trailer_buf, trailer_size);
+        overlay_offset = get_le32(trailer_buf + ph_size);
+        unsigned t_version = trailer_buf[4];
+        unsigned t_format  = trailer_buf[5];
+        unsigned t_method  = trailer_buf[6];
+        if ((off_t)overlay_offset < file_size && overlay_offset > sz_elf_hdrs
+        &&  t_version > 0 && t_version <= 14
+        &&  (int)t_format == my_format
+        &&  t_method >= M_NRV2B_LE32 && t_method <= M_LZMA) {
+            ph.version     = t_version;
+            ph.format      = t_format;
+            ph.method      = t_method;
+            ph.level       = trailer_buf[7];
+            ph.u_adler     = get_le32(trailer_buf + 8);
+            ph.c_adler     = get_le32(trailer_buf + 12);
+            ph.u_len       = get_le32(trailer_buf + 16);
+            ph.c_len       = get_le32(trailer_buf + 20);
+            ph.u_file_size = get_le32(trailer_buf + 24);
+            ph.filter      = trailer_buf[28];
+            ph.filter_cto  = trailer_buf[29];
+            found = true;
+        }
+        // Try 2: Scan for valid b_info chain (only for the primary Linux ELF packer)
+        if (!found && my_format == UPX_F_LINUX_ELF_i386) {
+            for (unsigned probe = sz_elf_hdrs + 24; probe < sz_elf_hdrs + 256; probe += 4) {
+                if (probe + 12 > file_size_u) break;
+                fi->seek(probe, SEEK_SET);
+                b_info bprobe; memset(&bprobe, 0, sizeof(bprobe));
+                fi->readx(&bprobe, sizeof(bprobe));
+                unsigned su = get_te32(&bprobe.sz_unc);
+                unsigned sc = get_te32(&bprobe.sz_cpr);
+                unsigned m  = bprobe.b_method;
+                if (su > 0 && su < 0x100000 && sc > 0 && sc < su
+                &&  m >= M_NRV2B_LE32 && m <= M_LZMA && bprobe.b_extra == 0) {
+                    unsigned next = probe + 12 + sc;
+                    if (next + 12 <= file_size_u) {
+                        fi->seek(next, SEEK_SET);
+                        b_info bnext; memset(&bnext, 0, sizeof(bnext));
+                        fi->readx(&bnext, sizeof(bnext));
+                        unsigned nsu = get_te32(&bnext.sz_unc);
+                        unsigned nsc = get_te32(&bnext.sz_cpr);
+                        unsigned nm  = bnext.b_method;
+                        if (nsu > 0 && nsu < 0x200000 && nsc > 0 && nsc <= nsu
+                        &&  nm >= M_NRV2B_LE32 && nm <= M_LZMA) {
+                            overlay_offset = probe - 12;
+                            ph.version = 14;
+                            ph.format  = my_format;
+                            ph.method  = m;
+                            ph.level   = 1;
+                            ph.u_file_size = 0;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (found)
+            return true;
+    }
     return false;
 }
 
@@ -3511,6 +3583,84 @@ tribool PackLinuxElf64::canUnpack() // bool, except -1: format known, but not pa
     }
     if (super::canUnpack()) {
         return true;
+    }
+    if (opt->force_unpack) {
+        // --force-unpack: UPX! magic and other metadata may be clobbered.
+        // Strategy: try reading PackHeader from end of file first.
+        // If that looks invalid, scan for valid b_info chain to find overlay_offset.
+        unsigned const e_phnum_local = get_te16(&ehdri.e_phnum);
+        sz_elf_hdrs = sizeof(Elf64_Ehdr) + e_phnum_local * sizeof(Elf64_Phdr);
+
+        bool found = false;
+        // Try 1: Read overlay_offset and PackHeader from end of file
+        int const ph_size = 32;
+        int const trailer_size = ph_size + 4;
+        MemBuffer trailer_buf(trailer_size);
+        fi->seek(file_size - trailer_size, SEEK_SET);
+        fi->readx(trailer_buf, trailer_size);
+        overlay_offset = get_le32(trailer_buf + ph_size);
+        unsigned t_version = trailer_buf[4];
+        unsigned t_format  = trailer_buf[5];
+        unsigned t_method  = trailer_buf[6];
+        // Check if the PackHeader at end looks plausible
+        if ((off_t)overlay_offset < file_size && overlay_offset > sz_elf_hdrs
+        &&  t_version > 0 && t_version <= 14
+        &&  t_format == UPX_F_LINUX_ELF64_AMD64
+        &&  t_method >= M_NRV2B_LE32 && t_method <= M_LZMA) {
+            ph.version     = t_version;
+            ph.format      = t_format;
+            ph.method      = t_method;
+            ph.level       = trailer_buf[7];
+            ph.u_adler     = get_le32(trailer_buf + 8);
+            ph.c_adler     = get_le32(trailer_buf + 12);
+            ph.u_len       = get_le32(trailer_buf + 16);
+            ph.c_len       = get_le32(trailer_buf + 20);
+            ph.u_file_size = get_le32(trailer_buf + 24);
+            ph.filter      = trailer_buf[28];
+            ph.filter_cto  = trailer_buf[29];
+            found = true;
+        }
+        // Try 2: Scan for valid b_info chain to derive overlay_offset
+        if (!found) {
+            // l_info(12) + p_info(12) + first_b_info should be near start of file
+            // Scan candidate positions for first b_info (after ELF hdrs + NOTE segments)
+            for (unsigned probe = sz_elf_hdrs + 24; probe < sz_elf_hdrs + 256; probe += 4) {
+                if (probe + 12 > file_size_u) break;
+                fi->seek(probe, SEEK_SET);
+                b_info bprobe; memset(&bprobe, 0, sizeof(bprobe));
+                fi->readx(&bprobe, sizeof(bprobe));
+                unsigned su = get_te32(&bprobe.sz_unc);
+                unsigned sc = get_te32(&bprobe.sz_cpr);
+                unsigned m  = bprobe.b_method;
+                if (su > 0 && su < 0x100000 && sc > 0 && sc < su
+                &&  m >= M_NRV2B_LE32 && m <= M_LZMA && bprobe.b_extra == 0) {
+                    // Check next b_info in chain
+                    unsigned next = probe + 12 + sc;
+                    if (next + 12 <= file_size_u) {
+                        fi->seek(next, SEEK_SET);
+                        b_info bnext; memset(&bnext, 0, sizeof(bnext));
+                        fi->readx(&bnext, sizeof(bnext));
+                        unsigned nsu = get_te32(&bnext.sz_unc);
+                        unsigned nsc = get_te32(&bnext.sz_cpr);
+                        unsigned nm  = bnext.b_method;
+                        if (nsu > 0 && nsu < 0x200000 && nsc > 0 && nsc <= nsu
+                        &&  nm >= M_NRV2B_LE32 && nm <= M_LZMA) {
+                            // Valid chain found — overlay_offset = probe - 12 (p_info)
+                            overlay_offset = probe - 12;
+                            ph.version = 14;
+                            ph.format  = UPX_F_LINUX_ELF64_AMD64;
+                            ph.method  = m;
+                            ph.level   = 1;
+                            ph.u_file_size = 0;  // unknown
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (found)
+            return true;
     }
     return false;
 }
@@ -5438,7 +5588,7 @@ unsigned PackLinuxElf32::find_LOAD_gap(
     unsigned const hi = get_te32(&phdr[k].p_offset) +
                         get_te32(&phdr[k].p_filesz);
     unsigned lo = ph.u_file_size;
-    if (lo < hi)
+    if (lo < hi && !opt->force_unpack)
         throwCantPack("bad input: PT_LOAD beyond end-of-file");
     unsigned j = k;
     for (;;) { // circular search, optimize for adjacent ascending
@@ -5816,7 +5966,7 @@ unsigned PackLinuxElf64::find_LOAD_gap(
     unsigned const hi = get_te64(&phdr[k].p_offset) +
                         get_te64(&phdr[k].p_filesz);
     unsigned lo = ph.u_file_size;
-    if (lo < hi)
+    if (lo < hi && !opt->force_unpack)
         throwCantPack("bad input: PT_LOAD beyond end-of-file");
     unsigned j = k;
     for (;;) { // circular search, optimize for adjacent ascending
@@ -7062,12 +7212,14 @@ void PackLinuxElf64::un_shlib_1(
         struct b_info b;
     } hdr;
     fi->readx(&hdr, sizeof(hdr));
-    if (hdr.l.l_magic != UPX_MAGIC_LE32
-    ||  get_te16(&hdr.l.l_lsize) != (unsigned)lsize
-    ||  get_te32(&hdr.p.p_filesize) != ph.u_file_size
-    ||  get_te32(&hdr.b.sz_unc) < sz_elf_hdrs  // peek: 1st b_info covers Elf headers
-    ) {
-        throwCantUnpack("corrupt l_info/p_info/b_info");
+    if (!opt->force_unpack) {
+        if (hdr.l.l_magic != UPX_MAGIC_LE32
+        ||  get_te16(&hdr.l.l_lsize) != (unsigned)lsize
+        ||  get_te32(&hdr.p.p_filesize) != ph.u_file_size
+        ||  get_te32(&hdr.b.sz_unc) < sz_elf_hdrs  // peek: 1st b_info covers Elf headers
+        ) {
+            throwCantUnpack("corrupt l_info/p_info/b_info");
+        }
     }
     fi->seek(-(off_t)sizeof(struct b_info), SEEK_CUR); // hdr.b_info was a peek
 
@@ -7104,16 +7256,18 @@ void PackLinuxElf64::un_shlib_1(
     }
     memcpy(o_elfhdrs, ibuf, sz_elf_hdrs); // save de-compressed Elf headers
     Elf64_Ehdr const *const ehdro = (Elf64_Ehdr const *)(void const *)o_elfhdrs;
-    if (ehdro->e_type   !=ehdri.e_type
-    ||  ehdro->e_machine!=ehdri.e_machine
-    ||  ehdro->e_version!=ehdri.e_version
-        // less strict for EM_PPC64 to workaround earlier bug
-    ||  !( ehdro->e_flags==ehdri.e_flags
-        || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))
-    ||  ehdro->e_ehsize !=ehdri.e_ehsize
-        // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
-    ||  memcmp(ehdro->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {
-        throwCantUnpack("ElfXX_Ehdr corrupted");
+    if (!opt->force_unpack) {
+        if (ehdro->e_type   !=ehdri.e_type
+        ||  ehdro->e_machine!=ehdri.e_machine
+        ||  ehdro->e_version!=ehdri.e_version
+            // less strict for EM_PPC64 to workaround earlier bug
+        ||  !( ehdro->e_flags==ehdri.e_flags
+            || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))
+        ||  ehdro->e_ehsize !=ehdri.e_ehsize
+            // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
+        ||  memcmp(ehdro->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {
+            throwCantUnpack("ElfXX_Ehdr corrupted");
+        }
     }
     if (fo) {
         fo->write(ibuf, sz_block1);
@@ -7264,12 +7418,14 @@ void PackLinuxElf32::un_shlib_1(
         struct b_info b;
     } hdr;
     fi->readx(&hdr, sizeof(hdr));
-    if (hdr.l.l_magic != UPX_MAGIC_LE32
-    ||  get_te16(&hdr.l.l_lsize) != (unsigned)lsize
-    ||  get_te32(&hdr.p.p_filesize) != ph.u_file_size
-    ||  get_te32(&hdr.b.sz_unc) < sz_elf_hdrs  // peek: 1st b_info covers Elf headers
-    ) {
-        throwCantUnpack("corrupt l_info/p_info/b_info");
+    if (!opt->force_unpack) {
+        if (hdr.l.l_magic != UPX_MAGIC_LE32
+        ||  get_te16(&hdr.l.l_lsize) != (unsigned)lsize
+        ||  get_te32(&hdr.p.p_filesize) != ph.u_file_size
+        ||  get_te32(&hdr.b.sz_unc) < sz_elf_hdrs  // peek: 1st b_info covers Elf headers
+        ) {
+            throwCantUnpack("corrupt l_info/p_info/b_info");
+        }
     }
     fi->seek(-(off_t)sizeof(struct b_info), SEEK_CUR); // hdr.b_info was a peek
 
@@ -7306,16 +7462,18 @@ void PackLinuxElf32::un_shlib_1(
     }
     memcpy(o_elfhdrs, ibuf, sz_elf_hdrs); // save de-compressed Elf headers
     Elf32_Ehdr const *const ehdro = (Elf32_Ehdr const *)(void const *)o_elfhdrs;
-    if (ehdro->e_type   !=ehdri.e_type
-    ||  ehdro->e_machine!=ehdri.e_machine
-    ||  ehdro->e_version!=ehdri.e_version
-        // less strict for EM_PPC to workaround earlier bug
-    ||  !( ehdro->e_flags==ehdri.e_flags
-        || Elf32_Ehdr::EM_PPC == get_te16(&ehdri.e_machine))
-    ||  ehdro->e_ehsize !=ehdri.e_ehsize
-        // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
-    ||  memcmp(ehdro->e_ident, ehdri.e_ident, Elf32_Ehdr::EI_OSABI)) {
-        throwCantUnpack("ElfXX_Ehdr corrupted");
+    if (!opt->force_unpack) {
+        if (ehdro->e_type   !=ehdri.e_type
+        ||  ehdro->e_machine!=ehdri.e_machine
+        ||  ehdro->e_version!=ehdri.e_version
+            // less strict for EM_PPC to workaround earlier bug
+        ||  !( ehdro->e_flags==ehdri.e_flags
+            || Elf32_Ehdr::EM_PPC == get_te16(&ehdri.e_machine))
+        ||  ehdro->e_ehsize !=ehdri.e_ehsize
+            // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
+        ||  memcmp(ehdro->e_ident, ehdri.e_ident, Elf32_Ehdr::EI_OSABI)) {
+            throwCantUnpack("ElfXX_Ehdr corrupted");
+        }
     }
     if (fo) {
         fo->write(ibuf, sz_block1);
@@ -7773,40 +7931,82 @@ void PackLinuxElf64::unpack(OutputFile *fo)
     fi->seek(overlay_offset - sizeof(l_info), SEEK_SET);
     fi->readx(&linfo, sizeof(linfo));
     if (UPX_MAGIC_LE32 != get_le32(&linfo.l_magic)) {
-        NE32 const *const lp = (NE32 const *)(void const *)&linfo;
-        // Workaround for bug of extra linfo by some asl_pack2_Shdrs().
-        if (0==lp[0] && 0==lp[1] && 0==lp[2]) { // looks like blank extra
-            fi->readx(&linfo, sizeof(linfo));
-            if (UPX_MAGIC_LE32 == get_le32(&linfo.l_magic)) {
-                overlay_offset += sizeof(linfo);
+        if (opt->force_unpack) {
+            // --force-unpack: l_info is clobbered; seek directly to p_info
+            fi->seek(overlay_offset, SEEK_SET);
+        } else {
+            NE32 const *const lp = (NE32 const *)(void const *)&linfo;
+            // Workaround for bug of extra linfo by some asl_pack2_Shdrs().
+            if (0==lp[0] && 0==lp[1] && 0==lp[2]) { // looks like blank extra
+                fi->readx(&linfo, sizeof(linfo));
+                if (UPX_MAGIC_LE32 == get_le32(&linfo.l_magic)) {
+                    overlay_offset += sizeof(linfo);
+                }
+                else {
+                    throwCantUnpack("l_info corrupted");
+                }
             }
             else {
                 throwCantUnpack("l_info corrupted");
             }
-        }
-        else {
-            throwCantUnpack("l_info corrupted");
         }
     }
     lsize = get_te16(&linfo.l_lsize);
     p_info hbuf;  fi->readx(&hbuf, sizeof(hbuf));
     unsigned orig_file_size = get_te32(&hbuf.p_filesize);
     blocksize = get_te32(&hbuf.p_blocksize);
-    if ((u32_t)file_size > orig_file_size || blocksize > orig_file_size
-        || (orig_file_size >> 8) > (u32_t)file_size  // heuristic anti-fuzz
-        ||      (blocksize >> 8) > (u32_t)file_size
-        || !mem_size_valid(1, blocksize, OVERHEAD))
-        throwCantUnpack("p_info corrupted");
+    if (!opt->force_unpack) {
+        if ((u32_t)file_size > orig_file_size || blocksize > orig_file_size
+            || (orig_file_size >> 8) > (u32_t)file_size  // heuristic anti-fuzz
+            ||      (blocksize >> 8) > (u32_t)file_size
+            || !mem_size_valid(1, blocksize, OVERHEAD))
+            throwCantUnpack("p_info corrupted");
+    } else {
+        // --force-unpack: derive blocksize and orig_file_size from b_info chain
+        // Scan b_info blocks to find max sz_unc (= real blocksize)
+        // and sum of all sz_unc (= approx orig_file_size)
+        unsigned max_sz_unc = 0;
+        unsigned total_unc = 0;
+        upx_off_t scan_pos = fi->tell();
+        for (int blk = 0; blk < 100; ++blk) {
+            b_info bscan; memset(&bscan, 0, sizeof(bscan));
+            if (fi->read(&bscan, szb_info) != (int)szb_info) break;
+            unsigned su = get_te32(&bscan.sz_unc);
+            unsigned sc = get_te32(&bscan.sz_cpr);
+            if (su == 0) break;  // EOF marker
+            if (sc == 0 || sc > file_size_u) break;  // invalid
+            if (fi->tell() + sc > file_size) break;  // would seek past EOF
+            if (su > max_sz_unc) max_sz_unc = su;
+            total_unc += su;
+            fi->seek(sc, SEEK_CUR);  // skip compressed data
+        }
+        fi->seek(scan_pos, SEEK_SET);  // rewind
 
+        if (max_sz_unc > 0) {
+            blocksize = max_sz_unc;
+            orig_file_size = total_unc;
+        } else {
+            blocksize = 512 * 1024;
+            orig_file_size = file_size_u * 8;
+        }
+        if (!mem_size_valid(1, blocksize, OVERHEAD)) {
+            blocksize = 512 * 1024;  // cap to safe value
+        }
+        // Set ph.u_file_size so find_LOAD_gap works
+        if (ph.u_file_size == 0)
+            ph.u_file_size = orig_file_size;
+    }
     ibuf.alloc(blocksize + OVERHEAD);
     b_info bhdr; memset(&bhdr, 0, sizeof(bhdr));
     fi->readx(&bhdr, szb_info);
     ph.u_len = get_te32(&bhdr.sz_unc);
     ph.c_len = get_te32(&bhdr.sz_cpr);
     ph.set_method(bhdr.b_method, overlay_offset + sizeof(p_info));
-    if (ph.c_len > file_size_u || ph.c_len == 0 || ph.u_len == 0
-    ||  ph.u_len > orig_file_size)
-        throwCantUnpack("b_info corrupted");
+    if (!opt->force_unpack) {
+        if (ph.c_len > file_size_u || ph.c_len == 0 || ph.u_len == 0
+        ||  ph.u_len > orig_file_size)
+            throwCantUnpack("b_info corrupted");
+    }
     ph.filter_cto = bhdr.b_cto8;
     prev_method = bhdr.b_method;  // FIXME if multiple de-compressors
 
@@ -7860,16 +8060,18 @@ void PackLinuxElf64::unpack(OutputFile *fo)
         if (ph.u_len < sizeof(*ehdr))
             throwCantUnpack("ElfXX_Ehdr corrupted");
         decompress(ibuf, (upx_byte *)ehdr, false);
-        if (ehdr->e_type   !=ehdri.e_type
-        ||  ehdr->e_machine!=ehdri.e_machine
-        ||  ehdr->e_version!=ehdri.e_version
-            // less strict for EM_PPC64 to workaround earlier bug
-        ||  !( ehdr->e_flags==ehdri.e_flags
-            || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))
-        ||  ehdr->e_ehsize !=ehdri.e_ehsize
-            // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
-        ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {
-            throwCantUnpack("ElfXX_Ehdr corrupted");
+        if (!opt->force_unpack) {
+            if (ehdr->e_type   !=ehdri.e_type
+            ||  ehdr->e_machine!=ehdri.e_machine
+            ||  ehdr->e_version!=ehdri.e_version
+                // less strict for EM_PPC64 to workaround earlier bug
+            ||  !( ehdr->e_flags==ehdri.e_flags
+                || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))
+            ||  ehdr->e_ehsize !=ehdri.e_ehsize
+                // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
+            ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {
+                throwCantUnpack("ElfXX_Ehdr corrupted");
+            }
         }
         // Rewind: prepare for data phase
         fi->seek(- (off_t) (szb_info + ph.c_len), SEEK_CUR);
@@ -7907,6 +8109,7 @@ void PackLinuxElf64::unpack(OutputFile *fo)
         }
     }
 
+  try {
     upx_uint64_t const e_entry = get_te64(&ehdri.e_entry);
     unsigned off_entry = 0;
     phdr = phdri;
@@ -7943,7 +8146,6 @@ void PackLinuxElf64::unpack(OutputFile *fo)
         }
         loader_offset = off_entry - sz_d_info;
     }
-
     if (0x1000==get_te64(&phdri[0].p_filesz)  // detect C_BASE style
     &&  0==get_te64(&phdri[1].p_offset)
     &&  0==get_te64(&phdri[0].p_offset)
@@ -8058,12 +8260,16 @@ void PackLinuxElf64::unpack(OutputFile *fo)
     if (sz_unc == 0) { // uncompressed size 0 -> EOF
         // note: magic is always stored le32
         unsigned const sz_cpr = get_le32(&bhdr.sz_cpr);
-        if (sz_cpr != UPX_MAGIC_LE32)  // sz_cpr must be h->magic
+        if (sz_cpr != UPX_MAGIC_LE32 && !opt->force_unpack)  // sz_cpr must be h->magic
             throwCompressedDataViolation();
     }
-    else { // extra bytes after end?
+    else if (!opt->force_unpack) { // extra bytes after end?
         throwCompressedDataViolation();
     }
+  } catch (...) {
+    if (!opt->force_unpack) throw;
+    // --force-unpack: gap/EOF processing failed, but main PT_LOAD data was unpacked
+  }
 
     if (is_shlib) {
         un_DT_INIT(old_dtinit, (Elf64_Phdr *)(1+ (Elf64_Ehdr *)(void *)o_elfhdrs), dynhdr, fo);
@@ -8074,11 +8280,11 @@ void PackLinuxElf64::unpack(OutputFile *fo)
     ph.u_len = total_out;
 
     // all bytes must be written
-    if (fo && total_out != orig_file_size)
+    if (fo && total_out != orig_file_size && !opt->force_unpack)
         throwEOFException();
 
     // finally test the checksums
-    if (ph.c_adler != c_adler || ph.u_adler != u_adler)
+    if ((ph.c_adler != c_adler || ph.u_adler != u_adler) && !opt->force_unpack)
         throwChecksumError();
 }
 
@@ -9005,6 +9211,7 @@ Elf64_Sym const *PackLinuxElf64::elf_lookup(char const *name) const
 
 void PackLinuxElf32::unpack(OutputFile *fo)
 {
+  try { // outermost try for --force-unpack
     if (e_phoff != sizeof(Elf32_Ehdr)) {// Phdrs not contiguous with Ehdr
         throwCantUnpack("bad e_phoff");
     }
@@ -9027,30 +9234,67 @@ void PackLinuxElf32::unpack(OutputFile *fo)
     fi->seek(overlay_offset - sizeof(l_info), SEEK_SET);
     fi->readx(&linfo, sizeof(linfo));
     if (UPX_MAGIC_LE32 != get_le32(&linfo.l_magic)) {
-        NE32 const *const lp = (NE32 const *)(void const *)&linfo;
-        // Workaround for bug of extra linfo by some asl_pack2_Shdrs().
-        if (0==lp[0] && 0==lp[1] && 0==lp[2]) { // looks like blank extra
-            fi->readx(&linfo, sizeof(linfo));
-            if (UPX_MAGIC_LE32 == get_le32(&linfo.l_magic)) {
-                overlay_offset += sizeof(linfo);
+        if (opt->force_unpack) {
+            fi->seek(overlay_offset, SEEK_SET);
+        } else {
+            NE32 const *const lp = (NE32 const *)(void const *)&linfo;
+            // Workaround for bug of extra linfo by some asl_pack2_Shdrs().
+            if (0==lp[0] && 0==lp[1] && 0==lp[2]) { // looks like blank extra
+                fi->readx(&linfo, sizeof(linfo));
+                if (UPX_MAGIC_LE32 == get_le32(&linfo.l_magic)) {
+                    overlay_offset += sizeof(linfo);
+                }
+                else {
+                    throwCantUnpack("l_info corrupted");
+                }
             }
             else {
                 throwCantUnpack("l_info corrupted");
             }
-        }
-        else {
-            throwCantUnpack("l_info corrupted");
         }
     }
     lsize = get_te16(&linfo.l_lsize);
     p_info hbuf;  fi->readx(&hbuf, sizeof(hbuf));
     unsigned orig_file_size = get_te32(&hbuf.p_filesize);
     blocksize = get_te32(&hbuf.p_blocksize);
-    if ((u32_t)file_size > orig_file_size || blocksize > orig_file_size
-        || (orig_file_size >> 8) > (u32_t)file_size  // heuristic anti-fuzz
-        ||      (blocksize >> 8) > (u32_t)file_size
-        || !mem_size_valid(1, blocksize, OVERHEAD))
-        throwCantUnpack("p_info corrupted");
+    if (!opt->force_unpack) {
+        if ((u32_t)file_size > orig_file_size || blocksize > orig_file_size
+            || (orig_file_size >> 8) > (u32_t)file_size  // heuristic anti-fuzz
+            ||      (blocksize >> 8) > (u32_t)file_size
+            || !mem_size_valid(1, blocksize, OVERHEAD))
+            throwCantUnpack("p_info corrupted");
+    } else {
+        // --force-unpack: derive blocksize from b_info chain scan
+        unsigned max_sz_unc = 0;
+        unsigned total_unc = 0;
+        upx_off_t scan_pos = fi->tell();
+        for (int blk = 0; blk < 100; ++blk) {
+            b_info bscan; memset(&bscan, 0, sizeof(bscan));
+            if (fi->read(&bscan, szb_info) != (int)szb_info) break;
+            unsigned su = get_te32(&bscan.sz_unc);
+            unsigned sc = get_te32(&bscan.sz_cpr);
+            if (su == 0) break;
+            if (sc == 0 || sc > file_size_u) break;
+            if (fi->tell() + sc > file_size) break;  // would seek past EOF
+            if (su > max_sz_unc) max_sz_unc = su;
+            total_unc += su;
+            fi->seek(sc, SEEK_CUR);
+        }
+        fi->seek(scan_pos, SEEK_SET);
+
+        if (max_sz_unc > 0) {
+            blocksize = max_sz_unc;
+            orig_file_size = total_unc;
+        } else {
+            blocksize = 512 * 1024;
+            orig_file_size = ph.u_file_size ? ph.u_file_size : file_size_u * 8;
+        }
+        if (!mem_size_valid(1, blocksize, OVERHEAD)) {
+            blocksize = 512 * 1024;
+        }
+        if (ph.u_file_size == 0)
+            ph.u_file_size = orig_file_size;
+    }
 
     ibuf.alloc(blocksize + OVERHEAD);
     b_info bhdr; memset(&bhdr, 0, sizeof(bhdr));
@@ -9058,9 +9302,11 @@ void PackLinuxElf32::unpack(OutputFile *fo)
     ph.u_len = get_te32(&bhdr.sz_unc);
     ph.c_len = get_te32(&bhdr.sz_cpr);
     ph.set_method(bhdr.b_method, overlay_offset + sizeof(p_info));
-    if (ph.c_len > (unsigned)file_size || ph.c_len == 0 || ph.u_len == 0
-    ||  ph.u_len > orig_file_size)
-        throwCantUnpack("b_info corrupted");
+    if (!opt->force_unpack) {
+        if (ph.c_len > (unsigned)file_size || ph.c_len == 0 || ph.u_len == 0
+        ||  ph.u_len > orig_file_size)
+            throwCantUnpack("b_info corrupted");
+    }
     ph.filter_cto = bhdr.b_cto8;
     prev_method = bhdr.b_method;  // FIXME if multiple de-compressors
 
@@ -9075,6 +9321,7 @@ void PackLinuxElf32::unpack(OutputFile *fo)
     unsigned is_shlib = 0;
     loader_offset = 0;
     MemBuffer o_elfhdrs;
+  try { // --force-unpack: catch IO errors during decompression/gap processing
     Elf32_Phdr const *const dynhdr = elf_find_ptype(Elf32_Phdr::PT_DYNAMIC, phdri, c_phnum);
     // dynseg was set by PackLinuxElf32help1
     if (dynhdr && !(Elf32_Dyn::DF_1_PIE & elf_unsigned_dynamic(Elf32_Dyn::DT_FLAGS_1))) {
@@ -9094,16 +9341,18 @@ void PackLinuxElf32::unpack(OutputFile *fo)
         if (ph.u_len < sizeof(*ehdr))
             throwCantUnpack("ElfXX_Ehdr corrupted");
         decompress(ibuf, (upx_byte *)ehdr, false);
-        if (ehdr->e_type   !=ehdri.e_type
-        ||  ehdr->e_machine!=ehdri.e_machine
-        ||  ehdr->e_version!=ehdri.e_version
-            // less strict for EM_PPC to workaround earlier bug
-        ||  !( ehdr->e_flags==ehdri.e_flags
-            || Elf32_Ehdr::EM_PPC == get_te16(&ehdri.e_machine))
-        ||  ehdr->e_ehsize !=ehdri.e_ehsize
-            // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
-        ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf32_Ehdr::EI_OSABI)) {
-            throwCantUnpack("ElfXX_Ehdr corrupted");
+        if (!opt->force_unpack) {
+            if (ehdr->e_type   !=ehdri.e_type
+            ||  ehdr->e_machine!=ehdri.e_machine
+            ||  ehdr->e_version!=ehdri.e_version
+                // less strict for EM_PPC to workaround earlier bug
+            ||  !( ehdr->e_flags==ehdri.e_flags
+                || Elf32_Ehdr::EM_PPC == get_te16(&ehdri.e_machine))
+            ||  ehdr->e_ehsize !=ehdri.e_ehsize
+                // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
+            ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf32_Ehdr::EI_OSABI)) {
+                throwCantUnpack("ElfXX_Ehdr corrupted");
+            }
         }
         // Rewind: prepare for data phase
         fi->seek(- (off_t) (szb_info + ph.c_len), SEEK_CUR);
@@ -9141,6 +9390,7 @@ void PackLinuxElf32::unpack(OutputFile *fo)
         }
     }
 
+  try { // --force-unpack: catch errors from gap/loader/EOF processing
     upx_uint32_t const e_entry = get_te32(&ehdri.e_entry);
     unsigned off_entry = 0;
     phdr = phdri;
@@ -9178,7 +9428,6 @@ void PackLinuxElf32::unpack(OutputFile *fo)
         }
         loader_offset = off_entry - sz_d_info;
     }
-
     if (0x1000==get_te32(&phdri[0].p_filesz)  // detect C_BASE style
     &&  0==get_te32(&phdri[1].p_offset)
     &&  0==get_te32(&phdri[0].p_offset)
@@ -9290,12 +9539,16 @@ void PackLinuxElf32::unpack(OutputFile *fo)
     if (sz_unc == 0) { // uncompressed size 0 -> EOF
         // note: magic is always stored le32
         unsigned const sz_cpr = get_le32(&bhdr.sz_cpr);
-        if (sz_cpr != UPX_MAGIC_LE32)  // sz_cpr must be h->magic
+        if (sz_cpr != UPX_MAGIC_LE32 && !opt->force_unpack)  // sz_cpr must be h->magic
             throwCompressedDataViolation();
     }
-    else { // extra bytes after end?
+    else if (!opt->force_unpack) { // extra bytes after end?
         throwCompressedDataViolation();
     }
+  } catch (...) {
+    if (!opt->force_unpack) throw;
+    // --force-unpack: gap/EOF processing failed, but main PT_LOAD data was unpacked
+  }
 
     if (is_shlib) {
         un_DT_INIT(old_dtinit, (Elf32_Phdr *)(1+ (Elf32_Ehdr *)(void *)o_elfhdrs), dynhdr, fo);
@@ -9306,12 +9559,19 @@ void PackLinuxElf32::unpack(OutputFile *fo)
     ph.u_len = total_out;
 
     // all bytes must be written
-    if (fo && total_out != orig_file_size)
+    if (fo && total_out != orig_file_size && !opt->force_unpack)
         throwEOFException();
 
     // finally test the checksums
-    if (ph.c_adler != c_adler || ph.u_adler != u_adler)
+    if ((ph.c_adler != c_adler || ph.u_adler != u_adler) && !opt->force_unpack)
         throwChecksumError();
+  } catch (...) {
+    if (!opt->force_unpack) throw;
+  }
+  } catch (...) {
+    if (!opt->force_unpack) throw;
+    // --force-unpack: tolerate IO/decompression errors; partial output is OK
+  }
 }
 
 void PackLinuxElf::unpack(OutputFile * /*fo*/)

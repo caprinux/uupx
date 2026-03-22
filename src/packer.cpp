@@ -532,33 +532,35 @@ bool Packer::getPackHeader(const void *b, int blen, bool allow_incompressible) {
     if (!ph.decodePackHeaderFromBuf(SPAN_S_MAKE(const byte, bb, blen), blen))
         return false;
 
-    if (ph.version > getVersion())
-        throwCantUnpack("need a newer version of UPX");
-    // Some formats might be able to unpack old versions because
-    // their implementation hasn't changed. Ask them.
-    if (opt->cmd != CMD_FILEINFO)
-        if (!testUnpackVersion(ph.version))
-            return false;
+    if (!opt->force_unpack) {
+        if (ph.version > getVersion())
+            throwCantUnpack("need a newer version of UPX");
+        // Some formats might be able to unpack old versions because
+        // their implementation hasn't changed. Ask them.
+        if (opt->cmd != CMD_FILEINFO)
+            if (!testUnpackVersion(ph.version))
+                return false;
 
-    if (ph.c_len > ph.u_len || (ph.c_len == ph.u_len && !allow_incompressible) ||
-        ph.c_len >= file_size_u || ph.version <= 0 || ph.version >= 0xff)
-        throwCantUnpack("header corrupted");
-    else if (ph.u_len > ph.u_file_size) {
+        if (ph.c_len > ph.u_len || (ph.c_len == ph.u_len && !allow_incompressible) ||
+            ph.c_len >= file_size_u || ph.version <= 0 || ph.version >= 0xff)
+            throwCantUnpack("header corrupted");
+        else if (ph.u_len > ph.u_file_size) {
 #if 0
-        // FIXME: does this check make sense w.r.t. overlays ???
-        if (ph.format == UPX_F_WIN32_PE || ph.format == UPX_F_DOS_EXE)
-            // may get longer
-            ((void)0);
-        else
-            throwCantUnpack("header size corrupted");
+            // FIXME: does this check make sense w.r.t. overlays ???
+            if (ph.format == UPX_F_WIN32_PE || ph.format == UPX_F_DOS_EXE)
+                // may get longer
+                ((void)0);
+            else
+                throwCantUnpack("header size corrupted");
 #endif
-    }
-    if (!isValidCompressionMethod(ph.method))
-        throwCantUnpack("unknown compression method (try a newer version of UPX)");
+        }
+        if (!isValidCompressionMethod(ph.method))
+            throwCantUnpack("unknown compression method (try a newer version of UPX)");
 
-    // Some formats might be able to unpack "subformats". Ask them.
-    if (!testUnpackFormat(ph.format))
-        return false;
+        // Some formats might be able to unpack "subformats". Ask them.
+        if (!testUnpackFormat(ph.format))
+            return false;
+    }
 
     return true;
 }
