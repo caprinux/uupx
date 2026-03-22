@@ -18,6 +18,15 @@ A fork of [UPX](https://github.com/upx/upx) for security research, focused on un
 
 uUPX adds a `--force-unpack` flag that bypasses all metadata validation and recovers the original binary by trusting only the compressed data blocks (`b_info` chain), which must remain intact for the binary to self-execute at runtime.
 
+## Definition: what counts as "UPX-packed"
+
+We consider a binary to be UPX-packed -- regardless of how much metadata has been corrupted -- as long as:
+
+1. **The unpacking stub is unmodified.** The embedded decompression code (assembly entry point + C decompressor) that runs at load time has not been altered.
+2. **The binary can unpack itself at runtime.** When executed, the stub successfully decompresses the original program and transfers control to it with full functionality preserved.
+
+If these two conditions hold, then by definition all the information needed to statically recover the original binary is still present in the file. The runtime stub only reads the `b_info` block headers (compression method, block sizes) and the compressed data -- it never checks `UPX!` magic, checksums, `l_info`, `p_info`, or any of the other metadata that `upx -d` validates. Therefore, any metadata that the stub ignores can be freely clobbered without affecting our ability to unpack.
+
 ## Usage
 
 ```bash
